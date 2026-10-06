@@ -1,0 +1,120 @@
+name: scheduled-smoke
+
+# Validates published cdk-go releases on a schedule, without any cross-repo
+# credentials: the app repo polls the module proxy for the latest stable and
+# nightly tags and runs the smoke flow against testnut.
+on:
+  schedule:
+    # Runs after the cdk nightly build (02:17 UTC) has had time to publish.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional cdk-go version to test (e.g. v0.18.1). Empty = latest stable + nightly."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CGO_ENABLED: "1"
+  MINT: https://testnut.cashudevkit.org
+
+concurrency:
+  group: scheduled-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        track:
+          - stable
+          - nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve cdk-go version
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          override="${{ github.event.inputs.version }}"
+          if [ -n "$override" ]; then
+            ver="$override"
+          elif [ "${{ matrix.track }}" = "nightly" ]; then
+            ver="$(go list -m -versions github.com/cashubtc/cdk-go \
+              | tr ' ' '\n' | grep -E -- '-nightly\.' | sort -V | tail -n1)"
+            if [ -z "$ver" ]; then
+              echo "no nightly release found" >&2
+              exit 1
+            fi
+          else
+            ver="latest"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "track=${{ matrix.track }} -> $ver"
+
+      - name: Pin cdk-go
+        run: go get github.com/cashubtc/cdk-go@${{ steps.resolve.outputs.version }}
+
+      - name: Build
+        run: go build ./...
+
+      - name: Smoke
+        id: smoke
+        shell: bash
+        run: |
+          set +e
+          go run ./cmd/cashu smoke --mint "$MINT" 2>&1 | tee smoke-report.txt
+          code=${PIPESTATUS[0]}
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## smoke: ${{ matrix.track }} (${{ steps.resolve.outputs.version }})"
+            echo ""
+            echo '```'
+            cat smoke-report.txt 2>/dev/null || echo "no output captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report-${{ matrix.track }}
+          path: smoke-report.txt
+          if-no-files-found: warn
+
+      - name: File or update an issue on failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="scheduled smoke failing: ${{ matrix.track }}"
+          link="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          tail_output="$(tail -n 40 smoke-report.txt 2>/dev/null || echo 'no report captured')"
+          body="$(printf 'The `%s` smoke run failed for cdk-go `%s`.\n\nWorkflow run: %s\n\n```\n%s\n```\n' \
+            "${{ matrix.track }}" "${{ steps.resolve.outputs.version }}" "$link" "$tail_output")"
+          existing="$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "${existing:-}" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

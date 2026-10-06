@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "1"
+  MINT: https://testnut.cashudevkit.org
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download modules
+        run: go mod download
+
+      # Linux and macOS embed an rpath into the module cache via the cdk-go
+      # build tags, so the shared library is found automatically. Windows has
+      # no rpath, so the DLL directory must be on PATH.
+      - name: Expose cdk-go native library (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$(go env GOOS)_$(go env GOARCH)"
+          moddir="$(go list -m -f '{{.Dir}}' github.com/cashubtc/cdk-go)"
+          echo "$moddir/bindings/cdkffi/native/$target" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Offline tests
+        run: go test ./...
+
+      - name: End-to-end smoke against testnut
+        run: go run ./cmd/cashu smoke --mint "${{ env.MINT }}"
